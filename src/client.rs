@@ -16,7 +16,6 @@ use crate::biome::Biome;
 use crate::block_pos::BlockPos;
 use crate::chunk_pos::ChunkPos;
 use crate::config::Config;
-use crate::dimension::DimensionId;
 use crate::entity::data::Player;
 use crate::entity::{
     velocity_to_packet_units, Entities, EntityEvent, EntityId, EntityKind, StatusOrAnimation,
@@ -25,12 +24,12 @@ use crate::ident::Ident;
 use crate::player_list::{PlayerListId, PlayerLists};
 use crate::player_textures::SignedPlayerTextures;
 use crate::protocol::packets::c2s::play::{
-    C2sPlayPacket, DiggingStatus, InteractKind, PlayerCommandId,
+    C2sPlayPacket, ClientStatus, DiggingStatus, InteractKind, PlayerCommandId,
 };
 pub use crate::protocol::packets::s2c::play::TitleFade;
 use crate::protocol::packets::s2c::play::{
     BiomeRegistry, ChatTypeRegistry, ChunkLoadDistance, ChunkRenderDistanceCenter, ClearTitles,
-    DimensionTypeRegistry, DimensionTypeRegistryEntry, Disconnect, EntitiesDestroy,
+    DeathMessage, DimensionTypeRegistry, DimensionTypeRegistryEntry, Disconnect, EntitiesDestroy,
     EntityAnimation, EntityAttributes, EntityAttributesProperty, EntityPosition, EntitySetHeadYaw,
     EntityStatus, EntityTrackerUpdate, EntityVelocityUpdate, ExperienceBarUpdate, GameJoin,
     GameMessage, GameStateChange, GameStateChangeReason, HealthUpdate, KeepAlive, MoveRelative,
@@ -190,6 +189,8 @@ pub struct Client<C: Config> {
     uuid: Uuid,
     username: String,
     textures: Option<SignedPlayerTextures>,
+    /// World client is currently in. Default value is **invalid** and must
+    /// be set by calling [`Client::spawn`].
     world: WorldId,
     old_player_list: Option<PlayerListId>,
     new_player_list: Option<PlayerListId>,
@@ -208,9 +209,9 @@ pub struct Client<C: Config> {
     /// confirmation. Inbound client position packets are ignored while this
     /// is nonzero.
     pending_teleports: u32,
-    spawn_position: BlockPos,
+    spawn_position: (WorldId, BlockPos),
     spawn_position_yaw: f32,
-    death_location: Option<(DimensionId, BlockPos)>,
+    death_location: Option<(WorldId, BlockPos)>,
     events: VecDeque<ClientEvent>,
     /// The ID of the last keepalive sent.
     last_keepalive_id: i64,
@@ -244,12 +245,13 @@ struct ClientBits {
     /// If the last sent keepalive got a response.
     got_keepalive: bool,
     hardcore: bool,
+    can_respawn: bool,
     attack_speed_modified: bool,
     movement_speed_modified: bool,
     velocity_modified: bool,
     created_this_tick: bool,
     view_distance_modified: bool,
-    #[bits(5)]
+    #[bits(4)]
     _pad: u8,
 }
 
@@ -279,7 +281,7 @@ impl<C: Config> Client<C> {
             view_distance: 2,
             teleport_id_counter: 0,
             pending_teleports: 0,
-            spawn_position: BlockPos::default(),
+            spawn_position: Default::default(),
             spawn_position_yaw: 0.0,
             death_location: None,
             events: VecDeque::new(),
@@ -355,6 +357,16 @@ impl<C: Config> Client<C> {
         self.bits.flat()
     }
 
+    /// Sets if this client can respawn.
+    pub fn set_can_respawn(&mut self, can_respawn: bool) {
+        self.bits.set_can_respawn(can_respawn);
+    }
+
+    /// Gets if this client can respawn.
+    pub fn can_respawn(&self) -> bool {
+        self.bits.can_respawn()
+    }
+
     /// Changes the world this client is located in and respawns the client.
     /// This can be used to respawn the client after death.
     ///
@@ -414,16 +426,24 @@ impl<C: Config> Client<C> {
 
     /// Gets the spawn position. The client will see `minecraft:compass` items
     /// point at the returned position.
-    pub fn spawn_position(&self) -> BlockPos {
+    pub fn spawn_position(&self) -> (WorldId, BlockPos) {
         self.spawn_position
     }
 
     /// Sets the spawn position. The client will see `minecraft:compass` items
     /// point at the provided position.
-    pub fn set_spawn_position(&mut self, pos: impl Into<BlockPos>, yaw_degrees: f32) {
+    pub fn set_spawn_position(
+        &mut self,
+        world: WorldId,
+        pos: impl Into<BlockPos>,
+        yaw_degrees: f32,
+    ) {
         let pos = pos.into();
-        if pos != self.spawn_position || yaw_degrees != self.spawn_position_yaw {
-            self.spawn_position = pos;
+        if world != self.spawn_position.0
+            || pos != self.spawn_position.1
+            || yaw_degrees != self.spawn_position_yaw
+        {
+            self.spawn_position = (world, pos);
             self.spawn_position_yaw = yaw_degrees;
             self.bits.set_modified_spawn_position(true);
         }
@@ -432,22 +452,22 @@ impl<C: Config> Client<C> {
     /// Gets the last death location of this client. The client will see
     /// `minecraft:recovery_compass` items point at the returned position.
     ///
-    /// If the client's current dimension differs from the returned
+    /// If the client's current world differs from the returned
     /// dimension or the location is `None` then the compass will spin
     /// randomly.
-    pub fn death_location(&self) -> Option<(DimensionId, BlockPos)> {
+    pub fn death_location(&self) -> Option<(WorldId, BlockPos)> {
         self.death_location
     }
 
     /// Sets the last death location. The client will see
     /// `minecraft:recovery_compass` items point at the provided position.
-    /// If the client's current dimension differs from the provided
-    /// dimension or the location is `None` then the compass will spin
+    /// If the client's current world differs from the provided
+    /// world or the location is `None` then the compass will spin
     /// randomly.
     ///
     /// Changes to the last death location take effect when the client
     /// (re)spawns.
-    pub fn set_death_location(&mut self, location: Option<(DimensionId, BlockPos)>) {
+    pub fn set_death_location(&mut self, location: Option<(WorldId, BlockPos)>) {
         self.death_location = location;
     }
 
@@ -564,15 +584,33 @@ impl<C: Config> Client<C> {
     ///
     /// # Arguments
     /// * `health` - Float in range `0.0..=20.0`. Value `<=0` is legal and will
-    ///   kill the player.
+    ///   kill the player. It will also set `dead` flag on the `Client`.
     /// * `food` - Integer in range `0..=20`.
     /// * `food_saturation` - Float in range `0.0..=5.0`.
     pub fn set_health_and_food(&mut self, health: f32, food: i32, food_saturation: f32) {
+        if health <= 0.0 {
+            self.set_can_respawn(true);
+        }
         self.send_packet(HealthUpdate {
             health,
             food: food.into(),
             food_saturation,
         })
+    }
+
+    /// Kills player. Shows `message` on the death screen. If an entity killed
+    /// the player, pass it's ID into the function.
+    pub fn kill(&mut self, killer: Option<EntityId>, message: impl Into<Text>) {
+        self.set_can_respawn(true);
+        let entity_id = match killer {
+            Some(k) => k.to_network_id(),
+            None => -1,
+        };
+        self.send_packet(DeathMessage {
+            player_id: VarInt(0),
+            entity_id, // and you are the killer!
+            message: message.into(),
+        });
     }
 
     /// Gets whether or not the client is connected to the server.
@@ -729,7 +767,20 @@ impl<C: Config> Client<C> {
                 timestamp: Duration::from_millis(p.timestamp),
             }),
             C2sPlayPacket::RequestChatPreview(_) => {}
-            C2sPlayPacket::ClientStatus(_) => {}
+            C2sPlayPacket::ClientStatus(p) => match p {
+                ClientStatus::PerformRespawn => {
+                    if self.bits.can_respawn() {
+                        self.events.push_back(ClientEvent::RespawnRequest);
+                    } else if !self.created_this_tick() {
+                        log::warn!(
+                            "unexpected ClientStatus::PerformRespawn from alive player {}",
+                            self.username()
+                        );
+                        self.disconnect_no_reason();
+                    }
+                }
+                ClientStatus::RequestStatus => (),
+            },
             C2sPlayPacket::ClientSettings(p) => {
                 self.events.push_back(ClientEvent::SettingsChanged {
                     locale: p.locale.0,
@@ -966,12 +1017,23 @@ impl<C: Config> Client<C> {
                     .initial_packets(|p| send_packet(&mut self.send, p));
             }
 
-            let mut dimension_names: Vec<_> = shared
-                .dimensions()
-                .map(|(id, _)| ident!("{LIBRARY_NAMESPACE}:dimension_{}", id.0))
-                .collect();
+            let mut dimension_names: Vec<_> =
+                shared.dimensions().map(|(id, _)| id.get_ident()).collect();
 
             dimension_names.push(ident!("{LIBRARY_NAMESPACE}:dummy_dimension"));
+
+            let last_death_location = match death_location_world_ident(self.death_location, worlds)
+            {
+                Ok(wi) => wi,
+                Err(_) => {
+                    log::warn!(
+                        "client {} has an invalid last death location and must be disconnected",
+                        self.username()
+                    );
+                    self.disconnect_no_reason();
+                    return;
+                }
+            };
 
             self.send_packet(GameJoin {
                 entity_id: 0, // EntityId 0 is reserved for clients.
@@ -980,14 +1042,8 @@ impl<C: Config> Client<C> {
                 previous_gamemode: self.old_game_mode,
                 dimension_names,
                 registry_codec: NbtBridge(make_registry_codec(shared)),
-                dimension_type_name: ident!(
-                    "{LIBRARY_NAMESPACE}:dimension_type_{}",
-                    world.meta.dimension().0
-                ),
-                dimension_name: ident!(
-                    "{LIBRARY_NAMESPACE}:dimension_{}",
-                    world.meta.dimension().0
-                ),
+                dimension_type_name: world.meta.dimension().get_ident(),
+                dimension_name: world.meta.dimension().get_ident(),
                 hashed_seed: 0,
                 max_players: VarInt(0),
                 view_distance: BoundedInt(VarInt(self.view_distance() as i32)),
@@ -996,9 +1052,7 @@ impl<C: Config> Client<C> {
                 enable_respawn_screen: false,
                 is_debug: false,
                 is_flat: self.bits.flat(),
-                last_death_location: self
-                    .death_location
-                    .map(|(id, pos)| (ident!("{LIBRARY_NAMESPACE}:dimension_{}", id.0), pos)),
+                last_death_location,
             });
 
             self.teleport(self.position(), self.yaw(), self.pitch());
@@ -1022,27 +1076,31 @@ impl<C: Config> Client<C> {
                     last_death_location: None,
                 });
 
+                let last_death_location =
+                    match death_location_world_ident(self.death_location, worlds) {
+                        Ok(wi) => wi,
+                        Err(_) => {
+                            log::warn!(
+                                "client {} has an invalid last death location and must be \
+                                 disconnected",
+                                self.username()
+                            );
+                            self.disconnect_no_reason();
+                            return;
+                        }
+                    };
+
                 self.send_packet(PlayerRespawn {
-                    dimension_type_name: ident!(
-                        "{LIBRARY_NAMESPACE}:dimension_type_{}",
-                        world.meta.dimension().0
-                    ),
-                    dimension_name: ident!(
-                        "{LIBRARY_NAMESPACE}:dimension_{}",
-                        world.meta.dimension().0
-                    ),
+                    dimension_type_name: world.meta.dimension().get_ident(),
+                    dimension_name: world.meta.dimension().get_ident(),
                     hashed_seed: 0,
                     game_mode: self.game_mode(),
                     previous_game_mode: self.game_mode(),
                     is_debug: false,
                     is_flat: self.bits.flat(),
                     copy_metadata: true,
-                    last_death_location: self
-                        .death_location
-                        .map(|(id, pos)| (ident!("{LIBRARY_NAMESPACE}:dimension_{}", id.0), pos)),
+                    last_death_location,
                 });
-
-                self.teleport(self.position(), self.yaw(), self.pitch());
             }
 
             // Update game mode
@@ -1110,10 +1168,13 @@ impl<C: Config> Client<C> {
         if self.bits.modified_spawn_position() {
             self.bits.set_modified_spawn_position(false);
 
-            self.send_packet(PlayerSpawnPosition {
-                location: self.spawn_position,
-                angle: self.spawn_position_yaw,
-            })
+            // Only point compass if client is in the same world
+            if self.world() == self.spawn_position().0 {
+                self.send_packet(PlayerSpawnPosition {
+                    location: self.spawn_position.1,
+                    angle: self.spawn_position_yaw,
+                })
+            }
         }
 
         // Update view distance fog on the client.
@@ -1434,6 +1495,21 @@ fn send_packet(send_opt: &mut SendOpt, pkt: impl Into<S2cPlayMessage>) {
             Ok(_) => {}
         }
     }
+}
+
+/// Maps `WorldId` to Dimension name
+fn death_location_world_ident<C: Config>(
+    death_location: Option<(WorldId, BlockPos)>,
+    worlds: &Worlds<C>,
+) -> Result<Option<(Ident, BlockPos)>, ()> {
+    let last_death_location = match death_location {
+        Some((id, pos)) => match worlds.get(id) {
+            Some(world) => Some((world.meta.dimension().get_ident(), pos)),
+            None => return Err(()),
+        },
+        None => None,
+    };
+    Ok(last_death_location)
 }
 
 fn send_entity_events(send_opt: &mut SendOpt, entity_id: i32, events: &[EntityEvent]) {
