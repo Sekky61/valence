@@ -1,7 +1,8 @@
 //! Dimension configuration and identification.
 
-use crate::ident;
+use crate::ident::Ident;
 use crate::protocol::packets::s2c::play::DimensionType;
+use crate::{ident, LIBRARY_NAMESPACE};
 
 /// Identifies a particular [`Dimension`] on the server.
 ///
@@ -12,6 +13,15 @@ use crate::protocol::packets::s2c::play::DimensionType;
 /// [`dimensions`](crate::server::SharedServer::dimensions).
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub struct DimensionId(pub(crate) u16);
+
+impl DimensionId {
+    /// Get Identifier of the dimension. In minecraft protocol, each Dimension
+    /// has a name and dimension type name. In Valence, they are **the
+    /// same**.
+    pub(crate) fn get_ident(self) -> Ident {
+        ident!("{LIBRARY_NAMESPACE}:dimension_type_{}", self.0)
+    }
+}
 
 /// The default dimension ID corresponds to the first element in the `Vec`
 /// returned by [`crate::config::Config::dimensions`].

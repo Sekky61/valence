@@ -88,6 +88,19 @@ impl From<BlockPos> for Vec3<i32> {
     }
 }
 
+/// Only [`Into`] is implemented, as [`f64`] can represent all [`i32`] values,
+/// but not the other way around
+impl Into<Vec3<f64>> for BlockPos {
+    fn into(self) -> Vec3<f64> {
+        let BlockPos { x, y, z } = self;
+        Vec3 {
+            x: x as f64,
+            y: y as f64,
+            z: z as f64,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
