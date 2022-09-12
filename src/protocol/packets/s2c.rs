@@ -577,6 +577,15 @@ pub mod play {
         }
     }
 
+    def_struct! {
+        DeathMessage {
+            player_id: VarInt,
+            /// Killer's entity ID, -1 if no killer
+            entity_id: i32,
+            message: Text
+        }
+    }
+
     def_enum! {
         UpdatePlayerList: VarInt {
             AddPlayer: Vec<PlayerListAddPlayer> = 0,
@@ -846,6 +855,7 @@ pub mod play {
             RotateAndMoveRelative = 41,
             Rotate = 42,
             ChatMessage = 51,
+            DeathMessage = 54,
             UpdatePlayerList = 55,
             PlayerPositionLook = 57,
             EntitiesDestroy = 59,

@@ -117,6 +117,7 @@ pub enum ClientEvent {
         /// Sequence number
         sequence: VarInt,
     },
+    RespawnRequest,
 }
 
 #[derive(Clone, PartialEq, Debug)]
@@ -274,6 +275,7 @@ pub fn handle_event_default<C: Config>(
         ClientEvent::SteerBoat { .. } => {}
         ClientEvent::Digging { .. } => {}
         ClientEvent::InteractWithBlock { .. } => {}
+        ClientEvent::RespawnRequest => {}
     }
 
     entity.set_world(client.world());
